@@ -2,13 +2,14 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 use crate::configuration::{Column, Configuration, FileType, OutputFormat};
-use crate::embedding::{calculate_embeddings, calculate_embeddings_mmap};
+use crate::embedding::{calculate_embeddings, calculate_embeddings_mmap, InitialFeatures};
 use crate::entity::{EntityProcessor, SMALL_VECTOR_SIZE};
 use crate::persistence::embedding::{EmbeddingPersistor, NpyPersistor, TextFileVectorPersistor};
 use crate::persistence::entity::InMemoryEntityMappingPersistor;
 use crate::sparse_matrix::{create_sparse_matrices, SparseMatrix};
 use bus::Bus;
 use log::{error, info};
+use ndarray_npy::read_npy;
 use simdjson_rust::dom;
 use smallvec::{smallvec, SmallVec};
 use std::sync::Arc;
@@ -50,13 +51,13 @@ pub fn build_graphs(
     match &config.file_type {
         FileType::Json => {
             let mut parser = dom::Parser::default();
-            read_file(config, |line| {
+            read_file(&config.input, Some(config.log_every_n), |line| {
                 let row = parse_json_line(line, &mut parser, &config.columns);
                 entity_processor.process_row(&row);
             });
         }
         FileType::Tsv => {
-            read_file(config, |line| {
+            read_file(&config.input, Some(config.log_every_n), |line| {
                 let row = parse_tsv_line(line);
                 entity_processor.process_row(&row);
             });
@@ -77,11 +78,11 @@ pub fn build_graphs(
 }
 
 /// Read file line by line. Pass every valid line to handler for parsing.
-fn read_file<F>(config: &Configuration, mut line_handler: F)
+fn read_file<F>(path: &String, log_every_n: Option<u32>, mut line_handler: F)
 where
     F: FnMut(&str),
 {
-    let input_file = File::open(&config.input).expect("Can't open file");
+    let input_file = File::open(path).expect("Can't open file");
     let mut buffered = BufReader::new(input_file);
 
     let mut line_number = 1u64;
@@ -104,8 +105,8 @@ where
         // clear to reuse the buffer
         line.clear();
 
-        if line_number % config.log_every_n as u64 == 0 {
-            info!("Number of lines processed: {}", line_number);
+        if let Some(0) = log_every_n.map(|n| line_number % n as u64) {
+            info!("Number of lines processed: {}", line_number)
         }
 
         line_number += 1;
@@ -160,10 +161,18 @@ pub fn train(
 ) {
     let config = Arc::new(config);
     let mut embedding_threads = Vec::new();
+    let initial_features: Option<Arc<InitialFeatures>> =
+        if config.initial_features.is_some() && config.initial_features_entities.is_some() {
+            Some(Arc::new(read_initial_features(&config)))
+        } else {
+            None
+        };
+
     for sparse_matrix in sparse_matrices {
         let sparse_matrix = Arc::new(sparse_matrix);
         let config = config.clone();
         let in_memory_entity_mapping_persistor = in_memory_entity_mapping_persistor.clone();
+        let initial_features = initial_features.clone();
         let handle = thread::spawn(move || {
             let directory = match config.output_dir.as_ref() {
                 Some(out) => format!("{}/", out.clone()),
@@ -193,6 +202,7 @@ pub fn train(
                     sparse_matrix.clone(),
                     in_memory_entity_mapping_persistor,
                     persistor.as_mut(),
+                    initial_features,
                 );
             } else {
                 calculate_embeddings_mmap(
@@ -200,6 +210,7 @@ pub fn train(
                     sparse_matrix.clone(),
                     in_memory_entity_mapping_persistor,
                     persistor.as_mut(),
+                    initial_features,
                 );
             }
         });
@@ -211,4 +222,18 @@ pub fn train(
             .join()
             .expect("Couldn't join on the associated thread");
     }
+}
+
+fn read_initial_features(config: &Configuration) -> InitialFeatures {
+    let path = config.initial_features.as_ref().unwrap().clone();
+    // TODO: Handle errors properly
+    let array: ndarray::Array2<f64> = read_npy(path).unwrap();
+
+    let mut entities = Vec::new();
+    let path = config.initial_features_entities.as_ref().unwrap().clone();
+    read_file(&path, None, |line| {
+        entities.push(line.strip_suffix("\n").unwrap_or(line).to_string())
+    });
+
+    InitialFeatures::new(entities, array)
 }

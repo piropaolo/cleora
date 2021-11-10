@@ -123,6 +123,18 @@ fn main() {
                 .default_value("textfile")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("initial-features")
+                .long("initial-features")
+                .help("Initial node features file path")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("initial-features-entities")
+                .long("initial-features-entities")
+                .help("Initial node features entities file path")
+                .takes_value(true),
+        )
         .get_matches();
 
     info!("Reading args...");
@@ -184,6 +196,11 @@ fn main() {
         _ => panic!("unsupported output format"),
     };
 
+    let initial_features = matches.value_of("initial-features").map(|s| s.to_string());
+    let initial_features_entities = matches
+        .value_of("initial-features-entities")
+        .map(|s| s.to_string());
+
     let config = Configuration {
         produce_entity_occurrence_count: true,
         embeddings_dimension: dimension,
@@ -198,6 +215,8 @@ fn main() {
         output_format,
         relation_name: relation_name.to_string(),
         columns,
+        initial_features,
+        initial_features_entities,
     };
     dbg!(&config);
 
