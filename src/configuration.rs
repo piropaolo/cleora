@@ -53,6 +53,12 @@ pub struct Configuration {
 
     /// Columns configuration
     pub columns: Vec<Column>,
+
+    /// Path to the initial node features file
+    pub initial_features: Option<String>,
+
+    /// Path to the initial node features entities file
+    pub initial_features_entities: Option<String>,
 }
 
 /// Column configuration
@@ -91,6 +97,8 @@ impl Configuration {
             output_format: OutputFormat::TextFile,
             relation_name: String::from("emb"),
             columns,
+            initial_features: None,
+            initial_features_entities: None
         }
     }
 

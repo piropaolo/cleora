@@ -24,6 +24,16 @@ const MAX_HASH_F32: f32 = MAX_HASH_I64 as f32;
 
 /// Wrapper for different types of matrix structures such as 2-dim vectors or memory-mapped files
 trait MatrixWrapper {
+    fn init_with_features<
+        T1: SparseMatrixReader + Sync + Send,
+        T2: EntityMappingPersistor + Sync + Send,
+    >(
+        initial_features: Arc<InitialFeatures>,
+        sparse_matrix_reader: Arc<T1>,
+        entity_mapping_persistor: Arc<T2>,
+        fixed_random_value: i64,
+    ) -> Self;
+
     /// Initializing a matrix with values from its dimensions and the hash values from the sparse matrix
     fn init_with_hashes<T: SparseMatrixReader + Sync + Send>(
         rows: usize,
@@ -53,6 +63,43 @@ struct TwoDimVectorMatrix {
 }
 
 impl MatrixWrapper for TwoDimVectorMatrix {
+    fn init_with_features<
+        T1: SparseMatrixReader + Sync + Send,
+        T2: EntityMappingPersistor + Sync + Send,
+    >(
+        initial_features: Arc<InitialFeatures>,
+        sparse_matrix_reader: Arc<T1>,
+        entity_mapping_persistor: Arc<T2>,
+        fixed_random_value: i64,
+    ) -> Self {
+        let result: Vec<Vec<f32>> = (0..initial_features.cols)
+            .into_par_iter()
+            .map(|i| {
+                let mut col: Vec<f32> = Vec::with_capacity(initial_features.rows);
+                for hash in sparse_matrix_reader.iter_hashes() {
+                    let entity_name_opt = entity_mapping_persistor.get_entity(hash.value);
+                    if let Some(entity_name) = entity_name_opt {
+                        let pos_opt = initial_features
+                            .entities
+                            .iter()
+                            .position(|e| *e == entity_name);
+                        let col_value = pos_opt
+                            .map(|pos| initial_features.array.get((pos, i)).map(|v| *v as f32))
+                            .flatten()
+                            .unwrap_or(init_value(i, hash.value, fixed_random_value));
+                        col.push(col_value);
+                    };
+                }
+                col
+            })
+            .collect();
+        Self {
+            rows: initial_features.rows,
+            cols: initial_features.cols,
+            matrix: result,
+        }
+    }
+
     fn init_with_hashes<T: SparseMatrixReader + Sync + Send>(
         rows: usize,
         cols: usize,
@@ -159,6 +206,55 @@ struct MMapMatrix {
 }
 
 impl MatrixWrapper for MMapMatrix {
+    fn init_with_features<
+        T1: SparseMatrixReader + Sync + Send,
+        T2: EntityMappingPersistor + Sync + Send,
+    >(
+        initial_features: Arc<InitialFeatures>,
+        sparse_matrix_reader: Arc<T1>,
+        entity_mapping_persistor: Arc<T2>,
+        fixed_random_value: i64,
+    ) -> Self {
+        let uuid = Uuid::new_v4();
+        let file_name = format!("{}_matrix_{}", sparse_matrix_reader.get_id(), uuid);
+        let mut mmap = create_mmap(
+            initial_features.rows,
+            initial_features.cols,
+            file_name.as_str(),
+        );
+
+        mmap.par_chunks_mut(initial_features.rows * 4)
+            .enumerate()
+            .for_each(|(i, chunk)| {
+                // i - number of dimension
+                // chunk - column/vector of bytes
+                for (j, hash) in sparse_matrix_reader.iter_hashes().enumerate() {
+                    let entity_name_opt = entity_mapping_persistor.get_entity(hash.value);
+                    if let Some(entity_name) = entity_name_opt {
+                        let pos_opt = initial_features
+                            .entities
+                            .iter()
+                            .position(|e| *e == entity_name);
+                        let col_value = pos_opt
+                            .map(|pos| initial_features.array.get((pos, i)).map(|v| *v as f32))
+                            .flatten()
+                            .unwrap_or(init_value(i, hash.value, fixed_random_value));
+                        MMapMatrix::update_column(j, chunk, |value| unsafe { *value = col_value });
+                    }
+                }
+            });
+
+        mmap.flush()
+            .expect("Can't flush memory map modifications to disk");
+
+        Self {
+            rows: initial_features.rows,
+            cols: initial_features.cols,
+            file_name,
+            matrix: mmap,
+        }
+    }
+
     fn init_with_hashes<T: SparseMatrixReader + Sync + Send>(
         rows: usize,
         cols: usize,
@@ -324,40 +420,61 @@ pub fn calculate_embeddings<T1, T2>(
     sparse_matrix_reader: Arc<T1>,
     entity_mapping_persistor: Arc<T2>,
     embedding_persistor: &mut dyn EmbeddingPersistor,
+    initial_features: Option<Arc<InitialFeatures>>,
 ) where
     T1: SparseMatrixReader + Sync + Send,
-    T2: EntityMappingPersistor,
+    T2: EntityMappingPersistor + Sync + Send,
 {
-    let mult = MatrixMultiplicator::new(config.clone(), sparse_matrix_reader);
-    let init: TwoDimVectorMatrix = mult.initialize();
+    let mult = MatrixMultiplicator::new(
+        config.clone(),
+        sparse_matrix_reader,
+        entity_mapping_persistor,
+    );
+
+    let init: TwoDimVectorMatrix = match initial_features {
+        Some(features) => mult.initialize_with_features(features),
+        None => mult.initialize(),
+    };
+
     let res = mult.propagate(config.max_number_of_iteration, init);
-    mult.persist(res, entity_mapping_persistor, embedding_persistor);
+    mult.persist(res, embedding_persistor);
 
     info!("Finalizing embeddings calculations!")
 }
 
 /// Provides matrix multiplication based on sparse matrix data.
 #[derive(Debug)]
-struct MatrixMultiplicator<T: SparseMatrixReader + Sync + Send, M: MatrixWrapper> {
+struct MatrixMultiplicator<
+    T1: SparseMatrixReader + Sync + Send,
+    T2: EntityMappingPersistor + Sync + Send,
+    M: MatrixWrapper,
+> {
     dimension: usize,
     number_of_entities: usize,
     fixed_random_value: i64,
-    sparse_matrix_reader: Arc<T>,
+    sparse_matrix_reader: Arc<T1>,
+    entity_mapping_persistor: Arc<T2>,
     _marker: PhantomData<M>,
 }
 
-impl<T, M> MatrixMultiplicator<T, M>
+impl<T1, T2, M> MatrixMultiplicator<T1, T2, M>
 where
-    T: SparseMatrixReader + Sync + Send,
+    T1: SparseMatrixReader + Sync + Send,
+    T2: EntityMappingPersistor + Sync + Send,
     M: MatrixWrapper,
 {
-    fn new(config: Arc<Configuration>, sparse_matrix_reader: Arc<T>) -> Self {
+    fn new(
+        config: Arc<Configuration>,
+        sparse_matrix_reader: Arc<T1>,
+        entity_mapping_persistor: Arc<T2>,
+    ) -> Self {
         let rand_value = config.seed.map(hash).unwrap_or(0);
         Self {
             dimension: config.embeddings_dimension as usize,
             number_of_entities: sparse_matrix_reader.get_number_of_entities() as usize,
             fixed_random_value: rand_value,
             sparse_matrix_reader,
+            entity_mapping_persistor,
             _marker: PhantomData,
         }
     }
@@ -374,6 +491,26 @@ where
             self.dimension,
             self.fixed_random_value,
             self.sparse_matrix_reader.clone(),
+        );
+
+        info!(
+            "Done initializing. Dims: {}, entities: {}.",
+            self.dimension, self.number_of_entities
+        );
+        result
+    }
+
+    fn initialize_with_features(&self, initial_features: Arc<InitialFeatures>) -> M {
+        info!(
+            "Start initialization. Dims: {}, entities: {}.",
+            self.dimension, self.number_of_entities
+        );
+
+        let result = M::init_with_features(
+            initial_features,
+            self.sparse_matrix_reader.clone(),
+            self.entity_mapping_persistor.clone(),
+            self.fixed_random_value,
         );
 
         info!(
@@ -412,14 +549,7 @@ where
     }
 
     /// Saves results to output such as textfile, numpy etc
-    fn persist<T1>(
-        &self,
-        res: M,
-        entity_mapping_persistor: Arc<T1>,
-        embedding_persistor: &mut dyn EmbeddingPersistor,
-    ) where
-        T1: EntityMappingPersistor,
-    {
+    fn persist(&self, res: M, embedding_persistor: &mut dyn EmbeddingPersistor) {
         info!("Start saving embeddings.");
 
         embedding_persistor
@@ -435,7 +565,7 @@ where
         // entities which can't be written to the file (error occurs)
         let mut broken_entities = HashSet::new();
         for (i, hash) in self.sparse_matrix_reader.iter_hashes().enumerate() {
-            let entity_name_opt = entity_mapping_persistor.get_entity(hash.value);
+            let entity_name_opt = self.entity_mapping_persistor.get_entity(hash.value);
             if let Some(entity_name) = entity_name_opt {
                 let mut embedding: Vec<f32> = Vec::with_capacity(self.dimension);
                 for j in 0..self.dimension {
@@ -480,14 +610,41 @@ pub fn calculate_embeddings_mmap<T1, T2>(
     sparse_matrix_reader: Arc<T1>,
     entity_mapping_persistor: Arc<T2>,
     embedding_persistor: &mut dyn EmbeddingPersistor,
+    initial_features: Option<Arc<InitialFeatures>>,
 ) where
     T1: SparseMatrixReader + Sync + Send,
-    T2: EntityMappingPersistor,
+    T2: EntityMappingPersistor + Sync + Send,
 {
-    let mult = MatrixMultiplicator::new(config.clone(), sparse_matrix_reader);
-    let init: MMapMatrix = mult.initialize();
+    let mult = MatrixMultiplicator::new(
+        config.clone(),
+        sparse_matrix_reader,
+        entity_mapping_persistor,
+    );
+    let init: TwoDimVectorMatrix = match initial_features {
+        Some(features) => mult.initialize_with_features(features),
+        None => mult.initialize(),
+    };
+
     let res = mult.propagate(config.max_number_of_iteration, init);
-    mult.persist(res, entity_mapping_persistor, embedding_persistor);
+    mult.persist(res, embedding_persistor);
 
     info!("Finalizing embeddings calculations!")
+}
+
+pub struct InitialFeatures {
+    rows: usize,
+    cols: usize,
+    entities: Vec<String>,
+    array: ndarray::Array2<f64>,
+}
+
+impl InitialFeatures {
+    pub fn new(entities: Vec<String>, array: ndarray::Array2<f64>) -> Self {
+        InitialFeatures {
+            rows: array.nrows(),
+            cols: array.ncols(),
+            entities,
+            array,
+        }
+    }
 }
